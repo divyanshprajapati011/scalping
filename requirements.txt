@@ -5,5 +5,5 @@ pandas
 openpyxl
 beautifulsoup4
 requests
-mysql.connector
+
 
