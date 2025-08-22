@@ -1,80 +1,48 @@
 import streamlit as st
 import pandas as pd
-import mysql.connector
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-import time, urllib.parse, re
-import hashlib
-import io
-import requests
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.common.exceptions import NoSuchElementException, WebDriverException
+import time, urllib.parse, re, hashlib, requests, io
 
-st.set_page_config(page_title="Google Maps Scraper with Login (MySQL)", layout="wide")
+st.set_page_config(page_title="Google Maps Scraper (No DB)", layout="wide")
 
-# ================== DATABASE SETUP ==================
-def get_connection():
-    return mysql.connector.connect(
-        host="localhost",
-        user="root",       # change if different
-        password="",       # add password if set
-        database="pythondb"
-    )
+# ================== USER STORAGE (in-memory) ==================
+# This will reset on every app reload
+if "users" not in st.session_state:
+    st.session_state.users = {}  # {username: {"password": hashed, "email": email}}
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.user = None
 
 # ================== SECURITY HELPERS ==================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 def register_user(username, password, email):
-    db = get_connection()
-    cursor = db.cursor()
-    try:
-        cursor.execute("INSERT INTO users (username, password, email) VALUES (%s,%s,%s)",
-                       (username, hash_password(password), email))
-        db.commit()
-        return True
-    except:
+    if username in st.session_state.users:
         return False
-    finally:
-        cursor.close()
-        db.close()
+    st.session_state.users[username] = {"password": hash_password(password), "email": email}
+    return True
 
 def login_user(username, password):
-    db = get_connection()
-    cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE username=%s AND password=%s",
-                   (username, hash_password(password)))
-    result = cursor.fetchone()
-    cursor.close()
-    db.close()
-    return result
+    user = st.session_state.users.get(username)
+    if user and user["password"] == hash_password(password):
+        return True
+    return False
 
 def fetch_all_users():
-    db = get_connection()
-    cursor = db.cursor()
-    cursor.execute("SELECT username, email FROM users")
-    rows = cursor.fetchall()
-    cursor.close()
-    db.close()
-    return rows
+    return [(u, info["email"]) for u, info in st.session_state.users.items()]
 
 def delete_user(username):
-    db = get_connection()
-    cursor = db.cursor()
-    cursor.execute("DELETE FROM users WHERE username=%s", (username,))
-    db.commit()
-    cursor.close()
-    db.close()
+    if username in st.session_state.users:
+        del st.session_state.users[username]
 
-# ================== LOGIN / REGISTER ==================
+# ================== SIDEBAR ==================
 st.sidebar.title("🔐 User Authentication")
 menu = st.sidebar.radio("Menu", ["Login", "Register", "Admin Panel"])
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user = None
 
 # -------- Register --------
 if menu == "Register":
@@ -87,7 +55,7 @@ if menu == "Register":
             if register_user(reg_user, reg_pass, reg_email):
                 st.success("✅ Registered successfully! Please login now.")
             else:
-                st.error("❌ Username already exists or DB error.")
+                st.error("❌ Username already exists.")
         else:
             st.warning("⚠️ Please fill all fields.")
 
@@ -97,11 +65,12 @@ elif menu == "Login":
     log_user = st.text_input("Username")
     log_pass = st.text_input("Password", type="password")
     if st.button("Login"):
-        user = login_user(log_user, log_pass)
-        if user:
+        if login_user(log_user, log_pass):
             st.session_state.logged_in = True
             st.session_state.user = log_user
             st.success(f"✅ Logged in as {log_user}")
+        else:
+            st.error("❌ Invalid credentials")
 
 # ================== SCRAPER (only after login) ==================
 if st.session_state.get("logged_in"):
@@ -111,7 +80,6 @@ if st.session_state.get("logged_in"):
         "top coaching in Bhopal"
     )
 
-    # Function to normalize input into a clean Google Maps Search URL
     def get_maps_url(user_input: str):
         user_input = user_input.strip()
         if "google.com/search" in user_input and "q=" in user_input:
@@ -130,7 +98,7 @@ if st.session_state.get("logged_in"):
     do_email_lookup = st.checkbox("Website से Email/extra Phones भी निकालें (slower)", value=True)
     start_btn = st.button("🚀 Start Scraping")
 
-    # ------------------------ Helpers ------------------------
+    # ------------------------ SCRAPER HELPERS ------------------------
     def setup_driver(headless: bool = True):
         options = webdriver.ChromeOptions()
         if headless:
@@ -158,7 +126,6 @@ if st.session_state.get("logged_in"):
     def extract_rating_and_reviews(driver):
         rating, reviews = "", ""
         try:
-            # Try main rating element
             stars = driver.find_element(By.XPATH, "//span[@role='img' and contains(@aria-label,'stars')]")
             aria = stars.get_attribute("aria-label") or ""
             r1 = re.search(r"(\d+(?:\.\d+)?)", aria)
@@ -167,7 +134,6 @@ if st.session_state.get("logged_in"):
             reviews = (rv.group(1).replace(",", "") if rv else "")
         except:
             try:
-                # Try alternate compact format
                 compact = driver.find_element(By.CLASS_NAME, "MW4etd").text.strip()
                 if compact:
                     m = re.search(r"(\d+(?:\.\d+)?)", compact)
@@ -177,7 +143,6 @@ if st.session_state.get("logged_in"):
             except:
                 pass
         return rating, reviews
- 
 
     EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
     PHONE_RE = re.compile(r"(?:\+?\d[\d\-\s]{7,}\d)")
@@ -198,7 +163,7 @@ if st.session_state.get("logged_in"):
     def scroll_results_panel(driver, hard_limit=500):
         try:
             panel = driver.find_element(By.XPATH, '//div[contains(@aria-label, "Results for")]')
-        except NoSuchElementException:
+        except:
             return
         last_h = driver.execute_script("return arguments[0].scrollHeight", panel)
         stagnant_loops = 0
@@ -230,7 +195,7 @@ if st.session_state.get("logged_in"):
                 cards = [None]
 
             count = 0
-            for idx, card in enumerate(cards):
+            for card in cards:
                 if limit and count >= limit:
                     break
                 if card is not None:
@@ -238,7 +203,7 @@ if st.session_state.get("logged_in"):
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'})", card)
                         card.click()
                         time.sleep(2.2)
-                    except WebDriverException:
+                    except:
                         continue
 
                 name = safe_text(By.XPATH, '//h1[contains(@class,"DUwDvf")]')
@@ -301,7 +266,7 @@ if st.session_state.get("logged_in"):
                 st.download_button("⬇️ Download Excel", data=out.getvalue(),
                                    file_name="maps_scrape.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.caption("Tip: अधिक results चाहिए तो listing URL दें (search results page), tool auto-scroll से ज़्यादा entries load कर लेगा.")
+                st.caption("Tip: अधिक results चाहिए तो listing URL दें, tool auto-scroll से ज़्यादा entries load कर लेगा.")
 
 # -------- Admin Panel --------
 elif menu == "Admin Panel":
