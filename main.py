@@ -1,48 +1,82 @@
 import streamlit as st
 import pandas as pd
+import mysql.connector
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+import time, urllib.parse, re
+import hashlib
+import io
+import requests
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-import time, urllib.parse, re, hashlib, requests, io
+from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-st.set_page_config(page_title="Google Maps Scraper (No DB)", layout="wide")
+st.set_page_config(page_title="Google Maps Scraper with Login (MySQL)", layout="wide")
 
-# ================== USER STORAGE (in-memory) ==================
-# This will reset on every app reload
-if "users" not in st.session_state:
-    st.session_state.users = {}  # {username: {"password": hashed, "email": email}}
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user = None
+# ================== DATABASE SETUP ==================
+def get_connection():
+    return mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",   # अपनी MySQL पासवर्ड डालें
+        database="pythondb"
+    )
 
 # ================== SECURITY HELPERS ==================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 def register_user(username, password, email):
-    if username in st.session_state.users:
+    db = get_connection()
+    cursor = db.cursor()
+    try:
+        cursor.execute("INSERT INTO users (username, password, email) VALUES (%s,%s,%s)",
+                       (username, hash_password(password), email))
+        db.commit()
+        return True
+    except:
         return False
-    st.session_state.users[username] = {"password": hash_password(password), "email": email}
-    return True
+    finally:
+        cursor.close()
+        db.close()
 
 def login_user(username, password):
-    user = st.session_state.users.get(username)
-    if user and user["password"] == hash_password(password):
-        return True
-    return False
+    db = get_connection()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE username=%s AND password=%s",
+                   (username, hash_password(password)))
+    result = cursor.fetchone()
+    cursor.close()
+    db.close()
+    return result
 
 def fetch_all_users():
-    return [(u, info["email"]) for u, info in st.session_state.users.items()]
+    db = get_connection()
+    cursor = db.cursor()
+    cursor.execute("SELECT username, email FROM users")
+    rows = cursor.fetchall()
+    cursor.close()
+    db.close()
+    return rows
 
 def delete_user(username):
-    if username in st.session_state.users:
-        del st.session_state.users[username]
+    db = get_connection()
+    cursor = db.cursor()
+    cursor.execute("DELETE FROM users WHERE username=%s", (username,))
+    db.commit()
+    cursor.close()
+    db.close()
 
-# ================== SIDEBAR ==================
+# ================== LOGIN / REGISTER ==================
 st.sidebar.title("🔐 User Authentication")
 menu = st.sidebar.radio("Menu", ["Login", "Register", "Admin Panel"])
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.user = None
 
 # -------- Register --------
 if menu == "Register":
@@ -55,7 +89,7 @@ if menu == "Register":
             if register_user(reg_user, reg_pass, reg_email):
                 st.success("✅ Registered successfully! Please login now.")
             else:
-                st.error("❌ Username already exists.")
+                st.error("❌ Username already exists or DB error.")
         else:
             st.warning("⚠️ Please fill all fields.")
 
@@ -65,12 +99,11 @@ elif menu == "Login":
     log_user = st.text_input("Username")
     log_pass = st.text_input("Password", type="password")
     if st.button("Login"):
-        if login_user(log_user, log_pass):
+        user = login_user(log_user, log_pass)
+        if user:
             st.session_state.logged_in = True
             st.session_state.user = log_user
             st.success(f"✅ Logged in as {log_user}")
-        else:
-            st.error("❌ Invalid credentials")
 
 # ================== SCRAPER (only after login) ==================
 if st.session_state.get("logged_in"):
@@ -80,6 +113,7 @@ if st.session_state.get("logged_in"):
         "top coaching in Bhopal"
     )
 
+    # Function to normalize input into a clean Google Maps Search URL
     def get_maps_url(user_input: str):
         user_input = user_input.strip()
         if "google.com/search" in user_input and "q=" in user_input:
@@ -98,7 +132,7 @@ if st.session_state.get("logged_in"):
     do_email_lookup = st.checkbox("Website से Email/extra Phones भी निकालें (slower)", value=True)
     start_btn = st.button("🚀 Start Scraping")
 
-    # ------------------------ SCRAPER HELPERS ------------------------
+    # ------------------------ Helpers ------------------------
     def setup_driver(headless: bool = True):
         options = webdriver.ChromeOptions()
         if headless:
@@ -123,26 +157,31 @@ if st.session_state.get("logged_in"):
         except:
             return ""
 
-    def extract_rating_and_reviews(driver):
-        rating, reviews = "", ""
-        try:
-            stars = driver.find_element(By.XPATH, "//span[@role='img' and contains(@aria-label,'stars')]")
-            aria = stars.get_attribute("aria-label") or ""
-            r1 = re.search(r"(\d+(?:\.\d+)?)", aria)
-            rating = r1.group(1) if r1 else ""
-            rv = re.search(r"(\d[\d,]*)\s+reviews", aria, re.I)
-            reviews = (rv.group(1).replace(",", "") if rv else "")
-        except:
-            try:
-                compact = driver.find_element(By.CLASS_NAME, "MW4etd").text.strip()
-                if compact:
-                    m = re.search(r"(\d+(?:\.\d+)?)", compact)
-                    if m: rating = m.group(1)
-                    m2 = re.search(r"\((\d[\d,]*)\)", compact)
-                    if m2: reviews = m2.group(1).replace(",", "")
-            except:
-                pass
-        return rating, reviews
+    # ✅ Rating & Reviews निकालने का Safe Function
+    # def get_rating_reviews(driver):
+    #     rating, reviews = "", ""
+    #     try:
+    #         # Method 1: सबसे common container
+    #         detail_panel = driver.find_element(By.XPATH, '//div[contains(@class,"m6QErb") and contains(@class,"WNBkOb")]')
+    #         stars = detail_panel.find_element(By.XPATH, './/span[@role="img" and contains(@aria-label,"stars")]')
+    #         aria = stars.get_attribute("aria-label") or ""
+    #     except:
+    #         try:
+    #             # Method 2: Direct h1 के पास वाले span से
+    #             stars = driver.find_element(By.XPATH, '//span[@role="img" and contains(@aria-label,"stars")]')
+    #             aria = stars.get_attribute("aria-label") or ""
+    #         except:
+    #             aria = ""
+
+    #     if aria:
+    #         r1 = re.search(r"(\d+(?:\.\d+)?)", aria)
+    #         rating = r1.group(1) if r1 else ""
+    #         rv = re.search(r"(\d[\d,]*)\s+reviews", aria, re.I)
+    #         reviews = (rv.group(1).replace(",", "") if rv else "")
+
+    #     return rating, reviews
+
+ 
 
     EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
     PHONE_RE = re.compile(r"(?:\+?\d[\d\-\s]{7,}\d)")
@@ -163,13 +202,13 @@ if st.session_state.get("logged_in"):
     def scroll_results_panel(driver, hard_limit=500):
         try:
             panel = driver.find_element(By.XPATH, '//div[contains(@aria-label, "Results for")]')
-        except:
+        except NoSuchElementException:
             return
         last_h = driver.execute_script("return arguments[0].scrollHeight", panel)
         stagnant_loops = 0
         while True:
             driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", panel)
-            time.sleep(1.6)
+            time.sleep(2.5)
             new_h = driver.execute_script("return arguments[0].scrollHeight", panel)
             if new_h == last_h:
                 stagnant_loops += 1
@@ -195,30 +234,52 @@ if st.session_state.get("logged_in"):
                 cards = [None]
 
             count = 0
-            for card in cards:
+            last_name = None   # पिछले business का नाम track करने के लिए
+
+            for idx, card in enumerate(cards):
                 if limit and count >= limit:
                     break
                 if card is not None:
                     try:
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'})", card)
                         card.click()
-                        time.sleep(2.2)
-                    except:
+
+                        # Wait until नया business name आ जाए
+                        WebDriverWait(driver, 10).until(
+                            lambda d: d.find_element(By.XPATH, '//h1[contains(@class,"DUwDvf")]').text.strip() != (last_name or "")
+                        )
+                        time.sleep(1.5)  
+                    except WebDriverException:
                         continue
 
+                # ✅ नया business name लो
                 name = safe_text(By.XPATH, '//h1[contains(@class,"DUwDvf")]')
-                if not name and card is not None:
-                    name = safe_text(By.CLASS_NAME, "qBF1Pd", ctx=card)
+                last_name = name   
+
                 website = safe_attr(By.XPATH, '//a[@data-item-id="authority"]', "href")
                 address = safe_text(By.XPATH, '//button[@data-item-id="address"]')
                 phone = safe_text(By.XPATH, '//button[starts-with(@data-item-id,"phone:")]')
-                rating, reviews = extract_rating_and_reviews(driver)
 
+                # ✅ Rating & Reviews अब detail panel से fresh scrape होंगे
+                rating, reviews = "", ""
+                try:
+                    detail_panel = driver.find_element(By.XPATH, '//div[contains(@class,"m6QErb") and contains(@class,"WNBkOb")]')
+                    stars = detail_panel.find_element(By.XPATH, './/span[@role="img" and contains(@aria-label,"stars")]')
+                    aria = stars.get_attribute("aria-label") or ""
+                    r1 = re.search(r"(\d+(?:\.\d+)?)", aria)
+                    rating = r1.group(1) if r1 else ""
+                    rv = re.search(r"(\d[\d,]*)\s+reviews", aria, re.I)
+                    reviews = (rv.group(1).replace(",", "") if rv else "")
+                except:
+                    pass
+
+                # अगर address नहीं मिला तो fallback
                 if not address:
                     address = safe_text(By.XPATH, "//div[contains(@class,'Io6YTe') and contains(text(),',')]")
                 if (not phone) and card is not None:
                     phone = safe_text(By.CLASS_NAME, "UsdlK", ctx=card)
 
+                # Email lookup (optional)
                 email_from_site = ""
                 extra_phones_from_site = ""
                 if email_lookup and website:
@@ -227,8 +288,8 @@ if st.session_state.get("logged_in"):
                 rows.append({
                     "Business Name": name,
                     "Website": website,
-                    "Rating": rating,
-                    "Reviews Count": reviews,
+                    # "Rating": rating,
+                    # "Reviews Count": reviews,
                     "Address": address,
                     "Phone (Maps)": phone,
                     "Email (from site)": email_from_site,
@@ -237,12 +298,15 @@ if st.session_state.get("logged_in"):
                 })
                 count += 1
 
+                # print(f"[{count}] {name} | ⭐ {rating} | Reviews: {reviews}")  # Debug print
+
             return pd.DataFrame(rows)
         finally:
             try:
                 driver.quit()
             except:
                 pass
+
 
     if start_btn:
         if not maps_url.strip():
@@ -266,7 +330,7 @@ if st.session_state.get("logged_in"):
                 st.download_button("⬇️ Download Excel", data=out.getvalue(),
                                    file_name="maps_scrape.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.caption("Tip: अधिक results चाहिए तो listing URL दें, tool auto-scroll से ज़्यादा entries load कर लेगा.")
+                st.caption("Tip: अधिक results चाहिए तो listing URL दें (search results page), tool auto-scroll से ज़्यादा entries load कर लेगा.")
 
 # -------- Admin Panel --------
 elif menu == "Admin Panel":
@@ -287,3 +351,22 @@ elif menu == "Admin Panel":
                 st.warning(f"❌ User '{del_user}' deleted successfully!")
         else:
             st.error("❌ Wrong Admin Credentials")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
