@@ -8,6 +8,8 @@ requests
 mysql.connector
 undetected-chromedriver
 setuptools
+wheel
+
 
 
 
